@@ -8,7 +8,7 @@ It can also apply aggressive hardening modules (kernel params, service sandboxin
 USB lockdown, etc.) with full reversibility.
 
 THREAT MODEL: This is designed for a personal workstation that requires
-high assurance – think "NASA level" auditing. It assumes the user is willing
+high assurance. It assumes the user is willing
 to review findings and accept potential breakage. It is NOT for production
 servers without careful testing. It will install additional packages
 (rkhunter, lynis, aide, clamav, etc.) if you allow it.
