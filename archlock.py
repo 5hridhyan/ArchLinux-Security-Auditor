@@ -37,9 +37,8 @@ from enum import Enum
 import difflib
 import re
 
-# ----------------------------------------------------------------------
+
 # signal handler for clean rollback
-# ----------------------------------------------------------------------
 
 _interrupted = False
 
@@ -50,16 +49,15 @@ def _signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, _signal_handler)
 
-# ----------------------------------------------------------------------
+
 # logging – structured output to journald (if available)
-# ----------------------------------------------------------------------
 
 def log_action(module: str, msg: str, level: str = "info", quiet: bool = False, no_color: bool = False):
     """log to journald via logger command, fallback to print if not quiet"""
     try:
         subprocess.run(["logger", "-t", f"archlock[{module}]", f"{level}: {msg}"],
                        check=False)
-    except Exception:  # broad but safe; we don't want logging to crash anything
+    except Exception:  # broad but safe; I think we don't want logging to crash anything
         pass
     if not quiet:
         if level == "error":
@@ -81,9 +79,8 @@ def log_action(module: str, msg: str, level: str = "info", quiet: bool = False, 
             else:
                 print(f"\033[92m{prefix}{msg}\033[0m")
 
-# ----------------------------------------------------------------------
+
 # core types
-# ----------------------------------------------------------------------
 
 class ModStatus(Enum):
     UNKNOWN = "unknown"
@@ -112,11 +109,10 @@ class ModInfo:
     deps: List[str]               # required packages
     conflicts: List[str]           # packages that conflict
     reversible: bool
-    risk: str                      # low / medium / high
+    risk: str                      # low or medium or high
 
-# ----------------------------------------------------------------------
+
 # persistent state – survives reboots, with schema versioning
-# ----------------------------------------------------------------------
 
 class State:
     """keeps a json log of all changes made by modules"""
@@ -191,9 +187,8 @@ class State:
                 del self.data[module]
             self._save()
 
-# ----------------------------------------------------------------------
+
 # backup manager – uses state to track backups
-# ----------------------------------------------------------------------
 
 class BackupKeeper:
     BACKUP_DIR = Path("/var/backups/archlock")
@@ -247,9 +242,8 @@ class BackupKeeper:
         pat = f"*.{module}.*.backup" if module else "*.backup"
         return sorted(self.dir.glob(pat), reverse=True)
 
-# ----------------------------------------------------------------------
+
 # diff viewer – unified diff with colours (if verbose and not no_color)
-# ----------------------------------------------------------------------
 
 def show_diff(old: str, new: str, path: str, verbose: bool, no_color: bool):
     if not verbose:
@@ -282,9 +276,8 @@ def show_diff(old: str, new: str, path: str, verbose: bool, no_color: bool):
             print(line, end='')
     print("\n" + "="*60)
 
-# ----------------------------------------------------------------------
+
 # atomic file write with rollback
-# ----------------------------------------------------------------------
 
 def atomic_write(path: Path, content: str, backup: Optional[Path], no_color: bool) -> bool:
     """write content to path atomically via tempfile, preserving metadata.
@@ -321,9 +314,8 @@ def atomic_write(path: Path, content: str, backup: Optional[Path], no_color: boo
             tmp.unlink()
         return False
 
-# ----------------------------------------------------------------------
+
 # base class for all hardening modules
-# ----------------------------------------------------------------------
 
 class Module:
     info = ModInfo(
@@ -510,9 +502,8 @@ class Module:
     def verify(self) -> Tuple[bool, str]:
         return True, "ok"
 
-# ----------------------------------------------------------------------
+
 # helper: bootloader detection
-# ----------------------------------------------------------------------
 
 def detect_bootloader() -> Tuple[str, Optional[Path]]:
     if Path("/boot/grub/grub.cfg").exists():
@@ -523,9 +514,8 @@ def detect_bootloader() -> Tuple[str, Optional[Path]]:
         return "efistub", None
     return None, None
 
-# ----------------------------------------------------------------------
+
 # module: firewall (nftables)
-# ----------------------------------------------------------------------
 
 class Firewall(Module):
     info = ModInfo(
@@ -673,9 +663,7 @@ table inet filter {{
             return False, "ruleset does not contain archlock marker"
         return True, "ok"
 
-# ----------------------------------------------------------------------
 # module: apparmor
-# ----------------------------------------------------------------------
 
 class AppArmor(Module):
     info = ModInfo(
@@ -799,9 +787,7 @@ class AppArmor(Module):
             return False, "apparmor not enabled in kernel"
         return True, "ok"
 
-# ----------------------------------------------------------------------
 # module: kernel (sysctl)
-# ----------------------------------------------------------------------
 
 class Kernel(Module):
     info = ModInfo(
@@ -903,9 +889,9 @@ kernel.perf_event_max_sample_rate = 1
                 return False, f"{param} = {r.stdout.strip()} (expected {expected})"
         return True, "ok"
 
-# ----------------------------------------------------------------------
+
 # module: service minimizer
-# ----------------------------------------------------------------------
+
 
 class ServiceMin(Module):
     info = ModInfo(
@@ -1038,9 +1024,8 @@ class ServiceMin(Module):
             return ModStatus.APPLIED
         return ModStatus.PARTIAL
 
-# ----------------------------------------------------------------------
+
 # module: firejail profiles
-# ----------------------------------------------------------------------
 
 class Firejail(Module):
     info = ModInfo(
@@ -1090,9 +1075,9 @@ x11
             return ModStatus.APPLIED
         return ModStatus.PARTIAL
 
-# ----------------------------------------------------------------------
+
 # module: auditd
-# ----------------------------------------------------------------------
+
 
 class Audit(Module):
     info = ModInfo(
@@ -1155,9 +1140,9 @@ class Audit(Module):
             return False, "identity rules not loaded"
         return True, "ok"
 
-# ----------------------------------------------------------------------
-# module: usb lockdown
-# ----------------------------------------------------------------------
+
+#usb lockdown (module)
+
 
 class UsbLockdown(Module):
     info = ModInfo(
@@ -1195,9 +1180,7 @@ class UsbLockdown(Module):
             return ModStatus.APPLIED
         return ModStatus.UNKNOWN
 
-# ----------------------------------------------------------------------
-# module: systemd sandboxing
-# ----------------------------------------------------------------------
+#systemd sandboxing (module)
 
 class SystemdSandbox(Module):
     info = ModInfo(
@@ -1291,9 +1274,7 @@ RestrictSUIDSGID=yes
             return ModStatus.PARTIAL
         return ModStatus.UNKNOWN
 
-# ----------------------------------------------------------------------
-# audit command – read‑only system scan
-# ----------------------------------------------------------------------
+#audit command (read only)
 
 def run_audit(quiet=False, no_color=False):
     if quiet:
@@ -1381,9 +1362,7 @@ def run_audit(quiet=False, no_color=False):
 
     print("\n" + "="*60)
 
-# ----------------------------------------------------------------------
-# doctor command – basic diagnostics
-# ----------------------------------------------------------------------
+#the doctor, basic diagnostic
 
 def run_doctor(quiet=False, no_color=False):
     if quiet:
@@ -1397,11 +1376,11 @@ def run_doctor(quiet=False, no_color=False):
 
     # check nftables
     if not no_color:
-        print("\n🔥 firewall:")
+        print("\n firewall:")
     else:
         print("\nfirewall:")
     
-    # Check if nftables package is installed
+    # check if nftables package is installed
     nft_installed = subprocess.run(["pacman", "-Q", "nftables"], capture_output=True)
     if nft_installed.returncode != 0:
         if not no_color:
@@ -1409,15 +1388,15 @@ def run_doctor(quiet=False, no_color=False):
         else:
             print("  FAIL: nftables package not installed")
     else:
-        # Check service status
+        # check service status
         nft_active = subprocess.run(["systemctl", "is-active", "nftables"], capture_output=True, text=True)
         nft_enabled = subprocess.run(["systemctl", "is-enabled", "nftables"], capture_output=True, text=True)
         
-        # Check if any rules are loaded
+        # check if any rules are loaded
         nft_rules = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True)
         rules_loaded = (nft_rules.returncode == 0 and nft_rules.stdout.strip() != "")
         
-        # Service status
+        # service status
         if nft_active.returncode == 0 and nft_active.stdout.strip() == "active":
             if not no_color:
                 print("  ✓ nftables service is active and running")
@@ -1436,7 +1415,7 @@ def run_doctor(quiet=False, no_color=False):
                 else:
                     print("  FAIL: nftables service not active and no rules loaded")
         
-        # Check if enabled on boot
+        # check if enabled on boot
         if nft_enabled.returncode == 0 and nft_enabled.stdout.strip() == "enabled":
             if not no_color:
                 print("  ✓ nftables enabled on boot")
@@ -1448,7 +1427,7 @@ def run_doctor(quiet=False, no_color=False):
             else:
                 print("  WARN: nftables not enabled on boot")
         
-        # Show rule count if verbose
+        # show rule count if verbose
         if rules_loaded and not quiet:
             rule_count = len([line for line in nft_rules.stdout.splitlines() 
                             if 'chain' in line or 'rule' in line])
@@ -1463,7 +1442,7 @@ def run_doctor(quiet=False, no_color=False):
     else:
         print("\napparmor:")
     
-    # Check if apparmor package is installed
+    # check if apparmor package is installed
     aa_installed = subprocess.run(["pacman", "-Q", "apparmor"], capture_output=True)
     if aa_installed.returncode != 0:
         if not no_color:
@@ -1478,7 +1457,7 @@ def run_doctor(quiet=False, no_color=False):
             else:
                 print("  OK: apparmor enabled in kernel")
             
-            # Check service status
+            # check service status
             aa_active = subprocess.run(["systemctl", "is-active", "apparmor"], capture_output=True, text=True)
             if aa_active.returncode == 0 and aa_active.stdout.strip() == "active":
                 if not no_color:
@@ -1491,7 +1470,7 @@ def run_doctor(quiet=False, no_color=False):
                 else:
                     print("  WARN: apparmor service not active")
             
-            # Get profile counts if aa-status available
+            # Get profile counts if aa-status available...
             aa_status = subprocess.run(["aa-status"], capture_output=True, text=True)
             if aa_status.returncode == 0:
                 import re
@@ -1555,7 +1534,7 @@ def run_doctor(quiet=False, no_color=False):
     else:
         print("\nauditd:")
     
-    # Check if audit package is installed
+    # check if the audit package is installed
     audit_installed = subprocess.run(["pacman", "-Q", "audit"], capture_output=True)
     if audit_installed.returncode != 0:
         if not no_color:
@@ -1570,7 +1549,7 @@ def run_doctor(quiet=False, no_color=False):
             else:
                 print("  OK: auditd service active")
             
-            # Check rules
+            # check rules
             audit_rules = subprocess.run(["auditctl", "-l"], capture_output=True, text=True)
             if audit_rules.returncode == 0:
                 if "-k identity" in audit_rules.stdout:
@@ -1584,7 +1563,7 @@ def run_doctor(quiet=False, no_color=False):
                     else:
                         print("  WARN: audit running but no rules")
                 
-                # Count rules
+                # count the rules
                 rule_count = len([line for line in audit_rules.stdout.splitlines() if line.strip()])
                 if not no_color and rule_count > 0:
                     print(f"  📊 {rule_count} audit rules active")
@@ -1599,7 +1578,7 @@ def run_doctor(quiet=False, no_color=False):
             else:
                 print("  FAIL: auditd service not active")
 
-    # Check for common issues
+    # check for common issues
     if not no_color:
         print("\n⚠️ common issues:")
     else:
@@ -1607,7 +1586,7 @@ def run_doctor(quiet=False, no_color=False):
     
     issues_found = False
     
-    # Check if reboot required (kernel updates)
+    # check if reboot required (kernel updates)
     if Path("/usr/lib/modules").exists():
         latest_kernel = sorted(Path("/usr/lib/modules").glob("*-ARCH"), reverse=True)
         if latest_kernel:
@@ -1619,7 +1598,7 @@ def run_doctor(quiet=False, no_color=False):
                     print("  WARN: reboot needed - kernel updated")
                 issues_found = True
     
-    # Check for pending package updates (optional)
+    # check for pending package updates (optional)
     if not quiet:
         updates = subprocess.run(["pacman", "-Qu"], capture_output=True, text=True)
         if updates.stdout.strip():
@@ -1637,9 +1616,7 @@ def run_doctor(quiet=False, no_color=False):
 
     print("\n" + "="*60)
 
-# ----------------------------------------------------------------------
-# presets – apply multiple modules at once
-# ----------------------------------------------------------------------
+#to apply multiple modules
 
 PRESETS = {
     "desktop": ["firewall", "kernel", "services", "firejail"],
@@ -1647,9 +1624,7 @@ PRESETS = {
     "hardened": ["firewall", "apparmor", "kernel", "services", "firejail", "auditd", "usb_lockdown", "systemd_sandbox"]
 }
 
-# ----------------------------------------------------------------------
-# main cli
-# ----------------------------------------------------------------------
+#the main cli
 
 class ArchLock:
     def __init__(self, quiet=False, verbose=False, no_color=False):
@@ -1827,9 +1802,7 @@ class ArchLock:
             else:
                 print(f"{r['when']} {r['module']} {r['path']} {r['backup']}")
 
-# ----------------------------------------------------------------------
-# entry point
-# ----------------------------------------------------------------------
+#the entry point
 
 def main():
     parser = argparse.ArgumentParser(
