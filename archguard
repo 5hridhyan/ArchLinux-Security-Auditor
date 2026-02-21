@@ -40,9 +40,8 @@ import difflib
 import re
 import time
 
-# ----------------------------------------------------------------------
+
 # signal handler for clean rollback
-# ----------------------------------------------------------------------
 
 _interrupted = False
 
@@ -53,9 +52,8 @@ def _signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, _signal_handler)
 
-# ----------------------------------------------------------------------
+
 # logging – structured output to journald (if available)
-# ----------------------------------------------------------------------
 
 def log_action(module: str, msg: str, level: str = "info", quiet: bool = False, no_color: bool = False):
     """log to journald via logger command, fallback to print if not quiet"""
@@ -79,9 +77,8 @@ def log_action(module: str, msg: str, level: str = "info", quiet: bool = False, 
             reset = "\033[0m" if not no_color else ""
             print(f"{color}{prefix}{msg}{reset}")
 
-# ----------------------------------------------------------------------
+
 # core types
-# ----------------------------------------------------------------------
 
 class ModStatus(Enum):
     UNKNOWN = "unknown"
@@ -115,9 +112,8 @@ class ModInfo:
     reversible: bool               # whether changes can be undone (always false for audit)
     risk: str                      # low / medium / high
 
-# ----------------------------------------------------------------------
+
 # persistent state – survives reboots, with schema versioning
-# ----------------------------------------------------------------------
 
 class State:
     """keeps a json log of all changes made by modules"""
@@ -188,9 +184,8 @@ class State:
                 del self.data[module]
             self._save()
 
-# ----------------------------------------------------------------------
+
 # backup manager – uses state to track backups
-# ----------------------------------------------------------------------
 
 class BackupKeeper:
     BACKUP_DIR = Path("/var/backups/archguard")
@@ -242,9 +237,8 @@ class BackupKeeper:
         pat = f"*.{module}.*.backup" if module else "*.backup"
         return sorted(self.dir.glob(pat), reverse=True)
 
-# ----------------------------------------------------------------------
+
 # diff viewer – unified diff with colours (if verbose and not no_color)
-# ----------------------------------------------------------------------
 
 def show_diff(old: str, new: str, path: str, verbose: bool, no_color: bool):
     if not verbose:
@@ -277,9 +271,8 @@ def show_diff(old: str, new: str, path: str, verbose: bool, no_color: bool):
             print(line, end='')
     print("\n" + "="*60)
 
-# ----------------------------------------------------------------------
+
 # atomic file write with rollback
-# ----------------------------------------------------------------------
 
 def atomic_write(path: Path, content: str, backup: Optional[Path], no_color: bool) -> bool:
     try:
@@ -308,9 +301,8 @@ def atomic_write(path: Path, content: str, backup: Optional[Path], no_color: boo
             tmp.unlink()
         return False
 
-# ----------------------------------------------------------------------
+
 # base class for all modules (hardening and audit)
-# ----------------------------------------------------------------------
 
 class Module:
     info = ModInfo(
@@ -508,9 +500,8 @@ class Module:
 
     # For audit modules: we can add a separate run_audit() method, but we'll just override apply() to perform the scan.
 
-# ----------------------------------------------------------------------
+
 # helper: bootloader detection
-# ----------------------------------------------------------------------
 
 def detect_bootloader() -> Tuple[str, Optional[Path]]:
     if Path("/boot/grub/grub.cfg").exists():
@@ -521,9 +512,8 @@ def detect_bootloader() -> Tuple[str, Optional[Path]]:
         return "efistub", None
     return None, None
 
-# ======================================================================
+
 # HARDENING MODULES (reused from archlock, with updates)
-# ======================================================================
 
 class Firewall(Module):
     info = ModInfo(
@@ -1772,9 +1762,8 @@ class LogAudit(Module):
 
         return True, "log audit completed"
 
-# ----------------------------------------------------------------------
+
 # presets – apply multiple modules at once
-# ----------------------------------------------------------------------
 
 PRESETS = {
     "desktop": ["firewall", "kernel", "services", "firejail"],
@@ -1783,9 +1772,8 @@ PRESETS = {
     "full_audit": ["rkhunter", "lynis", "aide", "clamav", "archsec", "network_audit", "pkg_verify", "log_audit"]
 }
 
-# ----------------------------------------------------------------------
+
 # main cli
-# ----------------------------------------------------------------------
 
 class ArchGuard:
     def __init__(self, quiet=False, verbose=False, no_color=False):
@@ -1974,9 +1962,9 @@ class ArchGuard:
             else:
                 print(f"{r['when']} {r['module']} {r['path']} {r['backup']}")
 
-# ----------------------------------------------------------------------
+
 # entry point
-# ----------------------------------------------------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(
