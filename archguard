@@ -1,0 +1,2086 @@
+#!/usr/bin/env python3
+"""
+archguard – aggressive security auditing & hardening for Arch Linux
+
+This tool goes beyond basic hardening: it runs deep security scans,
+checks for rootkits, vulnerabilities, misconfigurations, and integrity issues.
+It can also apply aggressive hardening modules (kernel params, service sandboxing,
+USB lockdown, etc.) with full reversibility.
+
+THREAT MODEL: This is designed for a personal workstation that requires
+high assurance – think "NASA level" auditing. It assumes the user is willing
+to review findings and accept potential breakage. It is NOT for production
+servers without careful testing. It will install additional packages
+(rkhunter, lynis, aide, clamav, etc.) if you allow it.
+
+The tool is modular: each module performs a specific task (audit or hardening).
+All changes are backed up and can be reverted. Audit modules are read-only
+and only report findings.
+
+If you dislike colors/emoji, use --quiet or --no-color.
+"""
+
+import os
+import sys
+import json
+import shutil
+import argparse
+import subprocess
+import hashlib
+import signal
+import tempfile
+import urllib.request
+import urllib.error
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any, Set
+from dataclasses import dataclass
+from enum import Enum
+import difflib
+import re
+import time
+
+# ----------------------------------------------------------------------
+# signal handler for clean rollback
+# ----------------------------------------------------------------------
+
+_interrupted = False
+
+def _signal_handler(sig, frame):
+    global _interrupted
+    _interrupted = True
+    print("\n\n⚠️ interrupted – will rollback if possible", file=sys.stderr)
+
+signal.signal(signal.SIGINT, _signal_handler)
+
+# ----------------------------------------------------------------------
+# logging – structured output to journald (if available)
+# ----------------------------------------------------------------------
+
+def log_action(module: str, msg: str, level: str = "info", quiet: bool = False, no_color: bool = False):
+    """log to journald via logger command, fallback to print if not quiet"""
+    try:
+        subprocess.run(["logger", "-t", f"archguard[{module}]", f"{level}: {msg}"],
+                       check=False)
+    except Exception:
+        pass
+    if not quiet:
+        prefix = f"[{module}] "
+        if level == "error":
+            color = "\033[91m" if not no_color else ""
+            reset = "\033[0m" if not no_color else ""
+            print(f"{color}{prefix}{msg}{reset}")
+        elif level == "warning":
+            color = "\033[93m" if not no_color else ""
+            reset = "\033[0m" if not no_color else ""
+            print(f"{color}{prefix}{msg}{reset}")
+        else:
+            color = "\033[92m" if not no_color else ""
+            reset = "\033[0m" if not no_color else ""
+            print(f"{color}{prefix}{msg}{reset}")
+
+# ----------------------------------------------------------------------
+# core types
+# ----------------------------------------------------------------------
+
+class ModStatus(Enum):
+    UNKNOWN = "unknown"
+    APPLIED = "applied"
+    PARTIAL = "partial"
+    CONFLICT = "conflict"
+    ERROR = "error"
+
+class ModKind(Enum):
+    FIREWALL = "firewall"
+    MAC = "mac"
+    SANDBOX = "sandbox"
+    KERNEL = "kernel"
+    SERVICE = "service"
+    FILESYSTEM = "filesystem"
+    AUDIT = "audit"          # read‑only audit modules
+    MALWARE = "malware"      # malware scanners
+    INTEGRITY = "integrity"  # file integrity checkers
+    NETWORK = "network"      # network scanners
+
+@dataclass
+class ModInfo:
+    """metadata for a hardening/audit module"""
+    name: str
+    kind: ModKind
+    desc: str
+    version: str
+    author: str
+    deps: List[str]               # required packages (will be installed if --install-deps)
+    conflicts: List[str]           # packages that conflict
+    reversible: bool               # whether changes can be undone (always false for audit)
+    risk: str                      # low / medium / high
+
+# ----------------------------------------------------------------------
+# persistent state – survives reboots, with schema versioning
+# ----------------------------------------------------------------------
+
+class State:
+    """keeps a json log of all changes made by modules"""
+    STATE_DIR = Path("/var/lib/archguard")
+    STATE_FILE = STATE_DIR / "state.json"
+    SCHEMA_VERSION = 2              # bumped for v2
+
+    def __init__(self):
+        self.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.data = self._load()
+
+    def _load(self) -> Dict[str, List[Dict]]:
+        if self.STATE_FILE.exists():
+            try:
+                with open(self.STATE_FILE) as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict) and "_schema_version" in raw:
+                    version = raw["_schema_version"]
+                    if version != self.SCHEMA_VERSION:
+                        print(f"warning: state file has schema v{version}, expected v{self.SCHEMA_VERSION}. Attempting to load anyway.", file=sys.stderr)
+                    return raw.get("modules", {})
+                else:
+                    return raw
+            except (json.JSONDecodeError, OSError):
+                return {}
+        return {}
+
+    def _save(self):
+        out = {
+            "_schema_version": self.SCHEMA_VERSION,
+            "modules": self.data
+        }
+        with open(self.STATE_FILE, 'w') as f:
+            json.dump(out, f, indent=2)
+
+    def add(self, module: str, path: str, backup: str, checksum: str = ""):
+        rec = {
+            "module": module,
+            "path": path,
+            "backup": backup,
+            "when": datetime.now().isoformat()
+        }
+        if checksum:
+            rec["checksum"] = checksum
+        self.data.setdefault(module, []).append(rec)
+        self._save()
+
+    def get(self, module: str = None, since: datetime = None, limit: int = None) -> List[Dict]:
+        recs = []
+        if module:
+            recs = self.data.get(module, [])
+        else:
+            recs = [r for modlist in self.data.values() for r in modlist]
+        recs.sort(key=lambda r: r["when"], reverse=True)
+        if since:
+            recs = [r for r in recs if datetime.fromisoformat(r["when"]) >= since]
+        if limit:
+            recs = recs[:limit]
+        return recs
+
+    def remove(self, module: str, path: str, backup: str):
+        if module in self.data:
+            self.data[module] = [
+                r for r in self.data[module]
+                if not (r["path"] == path and r["backup"] == backup)
+            ]
+            if not self.data[module]:
+                del self.data[module]
+            self._save()
+
+# ----------------------------------------------------------------------
+# backup manager – uses state to track backups
+# ----------------------------------------------------------------------
+
+class BackupKeeper:
+    BACKUP_DIR = Path("/var/backups/archguard")
+
+    def __init__(self, state: State):
+        self.dir = self.BACKUP_DIR
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.state = state
+
+    def _file_hash(self, path: Path) -> str:
+        sha = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for block in iter(lambda: f.read(65536), b''):
+                sha.update(block)
+        return sha.hexdigest()
+
+    def _copy_with_permissions(self, src: Path, dst: Path):
+        shutil.copy2(src, dst)
+        stat = src.stat()
+        os.chown(dst, stat.st_uid, stat.st_gid)
+        os.chmod(dst, stat.st_mode)
+
+    def create(self, path: str, module: str) -> Optional[Path]:
+        src = Path(path)
+        if not src.exists():
+            return None
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        dest = self.dir / f"{src.name}.{module}.{stamp}.backup"
+        self._copy_with_permissions(src, dest)
+        h = self._file_hash(dest)
+        self.state.add(module, path, str(dest), h)
+        return dest
+
+    def restore(self, path: str, backup_path: Path, expected_hash: str = "") -> bool:
+        if expected_hash:
+            actual = self._file_hash(backup_path)
+            if actual != expected_hash:
+                log_action("backup", f"hash mismatch for {backup_path}", "error")
+                return False
+        try:
+            dest = Path(path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            self._copy_with_permissions(backup_path, dest)
+            return True
+        except (OSError, shutil.Error):
+            return False
+
+    def list(self, module: str = None) -> List[Path]:
+        pat = f"*.{module}.*.backup" if module else "*.backup"
+        return sorted(self.dir.glob(pat), reverse=True)
+
+# ----------------------------------------------------------------------
+# diff viewer – unified diff with colours (if verbose and not no_color)
+# ----------------------------------------------------------------------
+
+def show_diff(old: str, new: str, path: str, verbose: bool, no_color: bool):
+    if not verbose:
+        return
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    diff = difflib.unified_diff(old_lines, new_lines,
+                                fromfile=f"{path} (current)",
+                                tofile=f"{path} (new)")
+    print("\n" + "="*60)
+    print(f"Changes for: {path}")
+    print("="*60)
+    for line in diff:
+        if line.startswith('+'):
+            if no_color:
+                print(line, end='')
+            else:
+                print(f"\033[92m{line}\033[0m", end='')
+        elif line.startswith('-'):
+            if no_color:
+                print(line, end='')
+            else:
+                print(f"\033[91m{line}\033[0m", end='')
+        elif line.startswith('@'):
+            if no_color:
+                print(line, end='')
+            else:
+                print(f"\033[94m{line}\033[0m", end='')
+        else:
+            print(line, end='')
+    print("\n" + "="*60)
+
+# ----------------------------------------------------------------------
+# atomic file write with rollback
+# ----------------------------------------------------------------------
+
+def atomic_write(path: Path, content: str, backup: Optional[Path], no_color: bool) -> bool:
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.tmp')
+        with os.fdopen(fd, 'w') as f:
+            f.write(content)
+        tmp = Path(tmp_path)
+
+        if backup and backup.exists():
+            st = backup.stat()
+            os.chown(tmp, st.st_uid, st.st_gid)
+            os.chmod(tmp, st.st_mode)
+        elif path.exists():
+            st = path.stat()
+            os.chown(tmp, st.st_uid, st.st_gid)
+            os.chmod(tmp, st.st_mode)
+        else:
+            os.chown(tmp, 0, 0)
+            os.chmod(tmp, 0o644)
+
+        tmp.rename(path)
+        return True
+    except Exception as e:
+        log_action("atomic_write", f"failed: {e}", "error", no_color=no_color)
+        if 'tmp' in locals() and tmp.exists():
+            tmp.unlink()
+        return False
+
+# ----------------------------------------------------------------------
+# base class for all modules (hardening and audit)
+# ----------------------------------------------------------------------
+
+class Module:
+    info = ModInfo(
+        name="base",
+        kind=ModKind.AUDIT,
+        desc="base module – you should not see this",
+        version="2.0.0",
+        author="archguard",
+        deps=[],
+        conflicts=[],
+        reversible=False,
+        risk="low"
+    )
+
+    def __init__(self, state: State, quiet: bool = False, verbose: bool = False, no_color: bool = False):
+        self.state = state
+        self.backups = BackupKeeper(state)
+        self.quiet = quiet
+        self.verbose = verbose
+        self.no_color = no_color
+        self._pre_checked = False
+
+    def pre_check(self, force: bool = False, install_deps: bool = False) -> Tuple[bool, str]:
+        """Check dependencies, optionally install missing packages."""
+        missing = []
+        for p in self.info.deps:
+            r = subprocess.run(["pacman", "-Q", p], capture_output=True)
+            if r.returncode != 0:
+                missing.append(p)
+        if missing:
+            if install_deps:
+                log_action(self.info.name, f"installing missing dependencies: {', '.join(missing)}", quiet=self.quiet, no_color=self.no_color)
+                for p in missing:
+                    subprocess.run(["pacman", "-S", "--noconfirm", p], check=False)
+                # recheck
+                for p in missing:
+                    r = subprocess.run(["pacman", "-Q", p], capture_output=True)
+                    if r.returncode != 0:
+                        return False, f"failed to install package '{p}'"
+            else:
+                return False, f"missing dependencies: {', '.join(missing)} (use --install-deps to auto-install)"
+
+        for p in self.info.conflicts:
+            r = subprocess.run(["pacman", "-Q", p], capture_output=True)
+            if r.returncode == 0:
+                if not force:
+                    return False, f"conflicting package '{p}' is installed (use --force to override)"
+                log_action(self.info.name, f"warning: conflicting package '{p}' is installed", "warning", self.quiet, self.no_color)
+
+        self._pre_checked = True
+        return True, "ok"
+
+    def gen_config(self, **kwargs) -> Dict[str, str]:
+        """For hardening modules: return {file: new_content}. For audit modules, return {}."""
+        return {}
+
+    def apply(self, dry: bool = False, force: bool = False, verify: bool = False, **kw) -> Tuple[bool, str]:
+        """Apply hardening changes. Audit modules should override this with their own scan logic."""
+        global _interrupted
+        if _interrupted:
+            return False, "interrupted before starting"
+
+        if not dry:
+            install_deps = kw.get("install_deps", False)
+            ok, msg = self.pre_check(force, install_deps)
+            if not ok:
+                return False, f"pre‑check failed: {msg}"
+
+        configs = self.gen_config(**kw)
+        if not configs:
+            return True, "nothing to do (or audit module – use 'audit' command)"
+
+        applied_changes = []
+        changed = False
+        for path, new in configs.items():
+            if _interrupted:
+                log_action(self.info.name, "interrupted – rolling back", "warning", self.quiet, self.no_color)
+                self._rollback_changes(applied_changes)
+                return False, "interrupted"
+
+            p = Path(path)
+            old = ""
+            if p.exists():
+                try:
+                    with open(p) as f:
+                        old = f.read()
+                except OSError as e:
+                    log_action(self.info.name, f"cannot read {path}: {e}", "warning", self.quiet, self.no_color)
+                    continue
+
+            if old == new:
+                continue
+
+            changed = True
+            show_diff(old, new, path, self.verbose, self.no_color)
+
+            if dry:
+                continue
+
+            if not force:
+                resp = input(f"apply changes to {path}? [y/N] ")
+                if resp.lower() != 'y':
+                    continue
+
+            backup_path = None
+            is_new = False
+            if p.exists():
+                b = self.backups.create(path, self.info.name)
+                if b:
+                    backup_path = b
+                    log_action(self.info.name, f"backup saved to {b}", quiet=self.quiet, no_color=self.no_color)
+            else:
+                self.state.add(self.info.name, path, "NEW_FILE")
+                is_new = True
+
+            success = atomic_write(p, new, backup_path if backup_path else None, self.no_color)
+            if not success:
+                log_action(self.info.name, f"failed to write {path}", "error", self.quiet, self.no_color)
+                self._rollback_changes(applied_changes)
+                return False, f"write failed for {path}"
+
+            log_action(self.info.name, f"applied {path}", quiet=self.quiet, no_color=self.no_color)
+            applied_changes.append((path, backup_path, is_new))
+
+        if not changed:
+            return True, "no changes needed (already up‑to‑date)"
+
+        if verify and not dry:
+            ok, msg = self.verify()
+            if not ok:
+                log_action(self.info.name, f"verification warning: {msg}", "warning", self.quiet, self.no_color)
+            else:
+                log_action(self.info.name, "runtime verification passed", quiet=self.quiet, no_color=self.no_color)
+
+        return True, "module applied"
+
+    def _rollback_changes(self, changes):
+        for path, backup_path, is_new in changes:
+            if not is_new and backup_path and Path(backup_path).exists():
+                self.backups.restore(path, Path(backup_path))
+                log_action(self.info.name, f"rolled back {path} from {backup_path}", quiet=self.quiet, no_color=self.no_color)
+                self.state.remove(self.info.name, path, backup_path)
+            else:
+                try:
+                    Path(path).unlink()
+                    log_action(self.info.name, f"removed newly created file {path}", quiet=self.quiet, no_color=self.no_color)
+                    self.state.remove(self.info.name, path, "NEW_FILE")
+                except OSError as e:
+                    log_action(self.info.name, f"failed to remove {path} during rollback: {e}", "error", self.quiet, self.no_color)
+
+    def revert(self) -> Tuple[bool, str]:
+        if not self.info.reversible:
+            return False, "module is not reversible"
+
+        changes = self.state.get(self.info.name)
+        if not changes:
+            return False, "no recorded changes for this module"
+
+        changes_sorted = sorted(changes, key=lambda x: x["when"], reverse=True)
+        reverted = 0
+        for rec in changes_sorted:
+            path = rec["path"]
+            backup = rec["backup"]
+            if backup == "NEW_FILE":
+                try:
+                    Path(path).unlink()
+                    log_action(self.info.name, f"removed created file {path}", quiet=self.quiet, no_color=self.no_color)
+                    reverted += 1
+                    self.state.remove(self.info.name, path, backup)
+                except OSError as e:
+                    log_action(self.info.name, f"failed to remove {path}: {e}", "error", self.quiet, self.no_color)
+            else:
+                bp = Path(backup)
+                if bp.exists():
+                    exp_hash = rec.get("checksum", "")
+                    if self.backups.restore(path, bp, exp_hash):
+                        log_action(self.info.name, f"restored {path} from {bp.name}", quiet=self.quiet, no_color=self.no_color)
+                        reverted += 1
+                        self.state.remove(self.info.name, path, backup)
+                    else:
+                        log_action(self.info.name, f"failed to restore {path} from {bp}", "error", self.quiet, self.no_color)
+                else:
+                    log_action(self.info.name, f"backup {bp} missing, cannot restore {path}", "error", self.quiet, self.no_color)
+
+        if reverted:
+            return True, f"reverted {reverted} change(s)"
+        return False, "no changes could be reverted"
+
+    def status(self) -> ModStatus:
+        """For hardening modules: check if applied. For audit modules: return UNKNOWN or based on last scan?"""
+        return ModStatus.UNKNOWN
+
+    def verify(self) -> Tuple[bool, str]:
+        return True, "ok"
+
+    # For audit modules: we can add a separate run_audit() method, but we'll just override apply() to perform the scan.
+
+# ----------------------------------------------------------------------
+# helper: bootloader detection
+# ----------------------------------------------------------------------
+
+def detect_bootloader() -> Tuple[str, Optional[Path]]:
+    if Path("/boot/grub/grub.cfg").exists():
+        return "grub", Path("/boot/grub/grub.cfg")
+    if Path("/boot/loader/entries").is_dir():
+        return "systemd-boot", None
+    if Path("/efi/EFI").is_dir() and list(Path("/efi/EFI").glob("*.efi")):
+        return "efistub", None
+    return None, None
+
+# ======================================================================
+# HARDENING MODULES (reused from archlock, with updates)
+# ======================================================================
+
+class Firewall(Module):
+    info = ModInfo(
+        name="firewall",
+        kind=ModKind.FIREWALL,
+        desc="nftables with profiles (workstation/server/paranoid/strict)",
+        version="2.0.0",
+        author="archguard",
+        deps=["nftables"],
+        conflicts=["ufw", "iptables"],
+        reversible=True,
+        risk="medium"
+    )
+
+    def pre_check(self, force=False, install_deps=False) -> Tuple[bool, str]:
+        ok, msg = super().pre_check(force, install_deps)
+        if not ok:
+            return ok, msg
+        for svc in ["docker", "libvirtd"]:
+            r = subprocess.run(["systemctl", "is-active", svc], capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip() == "active":
+                log_action(self.info.name, f"{svc} is running – nftables flush will remove its rules", "warning", self.quiet, self.no_color)
+                if not force:
+                    return False, f"{svc} is active, use --force to override"
+        return True, "ok"
+
+    def gen_config(self, profile="workstation") -> Dict[str, str]:
+        if profile == "strict":
+            config = """#!/usr/sbin/nft -f
+
+# archguard generated firewall – profile: strict
+# This configuration replaces all existing nftables rules.
+# It uses input and output drop policies with explicit allowances.
+
+flush ruleset
+
+table inet firewall {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif "lo" accept
+        ct state invalid drop
+        ct state established,related accept
+        udp sport 67 udp dport 68 accept
+        udp sport 547 udp dport 546 accept
+        counter drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy drop;
+        oif "lo" accept
+        ct state established,related accept
+        udp dport 53 accept
+        tcp dport 53 accept
+        tcp dport { 80, 443 } accept
+        udp dport 123 accept
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+        counter drop
+    }
+}
+"""
+            return {"/etc/nftables.conf": config}
+
+        head = """#!/usr/sbin/nft -f
+
+# archguard generated firewall – profile: {profile}
+# default‑drop policy, logs dropped packets
+# ⚠️ This configuration replaces all existing nftables rules.
+
+flush ruleset
+
+table inet filter {{
+    chain input {{
+        type filter hook input priority 0; policy drop;
+
+        iif lo accept
+        ct state established,related accept
+
+        ip protocol icmp icmp type {{ echo-request, echo-reply, destination-unreachable, time-exceeded }} accept
+        ip6 nexthdr icmpv6 icmpv6 type {{ echo-request, echo-reply, destination-unreachable, time-exceeded, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert }} accept
+"""
+
+        tail = """
+        log prefix "nftables INPUT drop: " counter drop
+    }}
+
+    chain forward {{
+        type filter hook forward priority 0; policy drop;
+        log prefix "nftables FORWARD drop: " counter drop
+    }}
+
+    chain output {{
+        type filter hook output priority 0; policy accept;
+    }}
+}}
+"""
+
+        profiles = {
+            "workstation": """
+        udp dport 68 accept                     # DHCP client
+        # udp dport 5353 accept                 # mDNS (Avahi) – uncomment if needed
+        tcp dport 22 ct state new limit rate 10/minute accept   # SSH rate limited
+""",
+            "server": """
+        tcp dport 22 ct state new limit rate 10/minute accept
+        # tcp dport {80,443} accept             # uncomment for web
+""",
+            "paranoid": """
+        # tcp dport 22 ct state new limit rate 10/minute accept   # optional SSH
+""",
+        }
+        middle = profiles.get(profile, profiles["workstation"])
+        full = head.format(profile=profile) + middle + tail
+        return {"/etc/nftables.conf": full}
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        profile = kw.get("profile", "workstation")
+        if profile == "strict" and not force and not dry:
+            return False, "strict profile is high‑risk – use --force to apply"
+        ok, msg = super().apply(dry, force, verify, profile=profile)
+        if ok and not dry:
+            subprocess.run(["systemctl", "enable", "nftables"], check=False)
+            subprocess.run(["systemctl", "start", "nftables"], check=False)
+            log_action(self.info.name, "nftables service enabled and started", quiet=self.quiet, no_color=self.no_color)
+        return ok, msg
+
+    def status(self) -> ModStatus:
+        r = subprocess.run(["systemctl", "is-active", "nftables"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip() == "active":
+            return ModStatus.APPLIED
+        r2 = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True)
+        if r2.returncode == 0 and r2.stdout.strip():
+            return ModStatus.PARTIAL
+        return ModStatus.UNKNOWN
+
+    def verify(self) -> Tuple[bool, str]:
+        r = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, "nftables not running or failed to list rules"
+        if "# archguard generated firewall" not in r.stdout:
+            return False, "ruleset does not contain archguard marker"
+        return True, "ok"
+
+class AppArmor(Module):
+    info = ModInfo(
+        name="apparmor",
+        kind=ModKind.MAC,
+        desc="enforce apparmor profiles, add kernel parameters",
+        version="2.0.0",
+        author="archguard",
+        deps=["apparmor"],
+        conflicts=["selinux"],
+        reversible=True,
+        risk="high"
+    )
+
+    def pre_check(self, force=False, install_deps=False) -> Tuple[bool, str]:
+        ok, msg = super().pre_check(force, install_deps)
+        if not ok:
+            return ok, msg
+        if not Path("/sys/kernel/security/apparmor").exists():
+            return False, "kernel does not support apparmor (need CONFIG_SECURITY_APPARMOR)"
+        r = subprocess.run(["systemctl", "cat", "apparmor.service"], capture_output=True)
+        if r.returncode != 0:
+            return False, "apparmor.service not found – is the package installed correctly?"
+        return True, "ok"
+
+    def gen_config(self) -> Dict[str, str]:
+        configs = {}
+        parser = "/etc/apparmor/parser.conf"
+        try:
+            if Path(parser).exists():
+                with open(parser) as f:
+                    cur = f.read()
+            else:
+                cur = ""
+        except OSError as e:
+            log_action(self.info.name, f"cannot read {parser}: {e}", "warning", self.quiet, self.no_color)
+            cur = ""
+
+        needed = [
+            "# Enable AppArmor",
+            'AA_ENABLED="yes"',
+            "# Set profiles to enforce mode",
+            'APPARMOR_PROFILE_MODE="enforce"',
+            "# Cache compiled profiles",
+            'WRITE_CACHE="yes"'
+        ]
+        new = cur
+        for line in needed:
+            if line not in new:
+                new += line + "\n"
+        if new != cur:
+            configs[parser] = new
+
+        bl_type, _ = detect_bootloader()
+        if bl_type == "grub":
+            grub = "/etc/default/grub"
+            try:
+                if Path(grub).exists():
+                    with open(grub) as f:
+                        grub_cur = f.read()
+                else:
+                    grub_cur = ""
+            except OSError as e:
+                log_action(self.info.name, f"cannot read {grub}: {e}", "warning", self.quiet, self.no_color)
+                grub_cur = ""
+
+            if grub_cur and 'GRUB_CMDLINE_LINUX_DEFAULT' in grub_cur:
+                def add_apparmor(m):
+                    line = m.group(0)
+                    if 'apparmor=1' not in line:
+                        line = line.rstrip('"') + ' apparmor=1 security=apparmor"'
+                    return line
+                grub_new = re.sub(r'GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"', add_apparmor, grub_cur)
+                if grub_new != grub_cur:
+                    configs[grub] = grub_new
+            elif grub_cur:
+                log_action(self.info.name, "GRUB_CMDLINE_LINUX_DEFAULT not found, cannot add apparmor automatically", "warning", self.quiet, self.no_color)
+        elif bl_type == "systemd-boot":
+            log_action(self.info.name, "systemd-boot detected – you need to manually add 'apparmor=1 security=apparmor' to kernel command line", "warning", self.quiet, self.no_color)
+        else:
+            log_action(self.info.name, "unknown bootloader – you must add apparmor kernel parameters manually", "warning", self.quiet, self.no_color)
+
+        return configs
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        ok, msg = super().apply(dry, force, verify, **kw)
+        if ok and not dry:
+            subprocess.run(["systemctl", "enable", "apparmor"], check=False)
+            subprocess.run(["systemctl", "start", "apparmor"], check=False)
+
+            aa_enforce = shutil.which("aa-enforce")
+            if aa_enforce:
+                profiles_dir = Path("/etc/apparmor.d")
+                if profiles_dir.exists():
+                    common = ["usr.bin.firefox", "usr.bin.chromium", "usr.bin.ssh",
+                              "usr.sbin.cupsd", "usr.bin.evince"]
+                    for prof in common:
+                        p = profiles_dir / prof
+                        if p.exists():
+                            subprocess.run([aa_enforce, str(p)], check=False)
+            else:
+                log_action(self.info.name, "aa-enforce not found – install apparmor-utils to enforce profiles", "warning", self.quiet, self.no_color)
+
+            changes = self.state.get(self.info.name)
+            if any(c["path"] == "/etc/default/grub" for c in changes):
+                log_action(self.info.name, "grub configuration changed, updating grub.cfg...", quiet=self.quiet, no_color=self.no_color)
+                subprocess.run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"], check=False)
+                log_action(self.info.name, "reboot required for apparmor kernel parameters to take effect", "warning", self.quiet, self.no_color)
+
+        return ok, msg
+
+    def status(self) -> ModStatus:
+        r = subprocess.run(["aa-status", "--enabled"], capture_output=True)
+        if r.returncode == 0:
+            return ModStatus.APPLIED
+        return ModStatus.UNKNOWN
+
+    def verify(self) -> Tuple[bool, str]:
+        r = subprocess.run(["aa-status", "--enabled"], capture_output=True)
+        if r.returncode != 0:
+            return False, "apparmor not enabled in kernel"
+        return True, "ok"
+
+class Kernel(Module):
+    info = ModInfo(
+        name="kernel",
+        kind=ModKind.KERNEL,
+        desc="sysctl hardening (kptr_restrict, dmesg_restrict, etc.)",
+        version="2.0.0",
+        author="archguard",
+        deps=[],
+        conflicts=[],
+        reversible=True,
+        risk="medium"
+    )
+
+    def gen_config(self, paranoid=False) -> Dict[str, str]:
+        content = """# archguard kernel hardening
+# these values are generally safe for workstations
+
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+
+# kernel.unprivileged_bpf_disabled = 1   # breaks some containers – uncomment if you don't need it
+
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_fifos = 2
+fs.protected_regular = 2
+
+kernel.yama.ptrace_scope = 1
+
+kernel.randomize_va_space = 2
+
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_rfc1337 = 1
+
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+"""
+        if paranoid:
+            extra = """
+# paranoid additions
+kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_enable = 0
+kernel.kexec_load_disabled = 1
+kernel.sysrq = 0
+kernel.perf_event_paranoid = 3
+kernel.perf_cpu_time_max_percent = 1
+kernel.perf_event_max_sample_rate = 1
+"""
+            content += extra
+        return {"/etc/sysctl.d/99-archguard.conf": content}
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        paranoid = kw.get("paranoid", False)
+        ok, msg = super().apply(dry, force, verify, paranoid=paranoid)
+        if ok and not dry:
+            subprocess.run(["sysctl", "--system"], check=False)
+        return ok, msg
+
+    def status(self) -> ModStatus:
+        checks = [
+            ("kernel.kptr_restrict", "2"),
+            ("kernel.dmesg_restrict", "1"),
+        ]
+        applied = 0
+        for param, expected in checks:
+            r = subprocess.run(["sysctl", "-n", param], capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip() == expected:
+                applied += 1
+        if applied == len(checks):
+            return ModStatus.APPLIED
+        elif applied > 0:
+            return ModStatus.PARTIAL
+        return ModStatus.UNKNOWN
+
+    def verify(self) -> Tuple[bool, str]:
+        checks = [
+            ("kernel.kptr_restrict", "2"),
+            ("kernel.dmesg_restrict", "1"),
+        ]
+        for param, expected in checks:
+            r = subprocess.run(["sysctl", "-n", param], capture_output=True, text=True)
+            if r.returncode != 0 or r.stdout.strip() != expected:
+                return False, f"{param} = {r.stdout.strip()} (expected {expected})"
+        return True, "ok"
+
+class ServiceMin(Module):
+    info = ModInfo(
+        name="services",
+        kind=ModKind.SERVICE,
+        desc="list and optionally disable unnecessary services",
+        version="2.0.0",
+        author="archguard",
+        deps=[],
+        conflicts=[],
+        reversible=True,
+        risk="high"
+    )
+
+    def __init__(self, state: State, quiet=False, verbose=False, no_color=False):
+        super().__init__(state, quiet, verbose, no_color)
+        self.suspicious = [
+            "avahi-daemon.service",
+            "cups.service",
+            "bluetooth.service",
+            "rpcbind.service",
+            "nfs-server.service",
+            "smb.service",
+            "telnet.socket",
+            "vsftpd.service"
+        ]
+
+    def analyze(self) -> Dict[str, List[str]]:
+        r = subprocess.run(
+            ["systemctl", "list-unit-files", "--type=service", "--state=enabled", "--no-legend"],
+            capture_output=True, text=True
+        )
+        enabled = [line.split()[0] for line in r.stdout.splitlines() if line]
+
+        r = subprocess.run(
+            ["systemctl", "list-units", "--type=service", "--state=running", "--no-legend"],
+            capture_output=True, text=True
+        )
+        running = [line.split()[0] for line in r.stdout.splitlines() if line]
+
+        susp_running = [s for s in running if s in self.suspicious]
+        susp_enabled = [s for s in enabled if s in self.suspicious]
+
+        return {
+            "running": running,
+            "enabled": enabled,
+            "susp_running": susp_running,
+            "susp_enabled": susp_enabled
+        }
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        data = self.analyze()
+
+        if self.verbose:
+            if not self.no_color:
+                print("\n📊 service analysis:")
+            else:
+                print("\nservice analysis:")
+            print(f"  total running: {len(data['running'])}")
+            print(f"  total enabled: {len(data['enabled'])}")
+
+        suspicious = set(data['susp_running'] + data['susp_enabled'])
+        if not suspicious:
+            log_action(self.info.name, "no suspicious services found", quiet=self.quiet, no_color=self.no_color)
+            return True, "nothing to do"
+
+        if self.verbose:
+            if not self.no_color:
+                print("\n⚠ potentially unnecessary services:")
+            else:
+                print("\npotentially unnecessary services:")
+            for svc in sorted(suspicious):
+                flags = []
+                if svc in data['susp_running']:
+                    flags.append("running")
+                if svc in data['susp_enabled']:
+                    flags.append("enabled")
+                print(f"  - {svc} ({', '.join(flags)})")
+
+        if dry:
+            return True, "analysis complete (dry run)"
+
+        if not force:
+            resp = input("disable these services? [y/N] ")
+            if resp.lower() != 'y':
+                return True, "no changes made"
+
+        for svc in suspicious:
+            was_running = svc in data['susp_running']
+            log_action(self.info.name, f"disabling {svc}...", quiet=self.quiet, no_color=self.no_color)
+            subprocess.run(["systemctl", "stop", svc], check=False)
+            subprocess.run(["systemctl", "disable", svc], check=False)
+            marker = "DISABLED_RUNNING" if was_running else "DISABLED_ENABLED"
+            self.state.add(self.info.name, f"service:{svc}", marker)
+            log_action(self.info.name, f"disabled {svc}", quiet=self.quiet, no_color=self.no_color)
+
+        if verify:
+            new_data = self.analyze()
+            if set(new_data['susp_running'] + new_data['susp_enabled']).intersection(suspicious):
+                log_action(self.info.name, "some services still appear active – manual check advised", "warning", self.quiet, self.no_color)
+        return True, "services disabled"
+
+    def revert(self) -> Tuple[bool, str]:
+        changes = self.state.get(self.info.name)
+        if not changes:
+            return False, "no recorded changes for this module"
+
+        reverted = 0
+        for rec in changes:
+            if not rec["path"].startswith("service:"):
+                continue
+            svc = rec["path"][8:]
+            marker = rec["backup"]
+            if marker in ("DISABLED_RUNNING", "DISABLED_ENABLED"):
+                log_action(self.info.name, f"re-enabling {svc}...", quiet=self.quiet, no_color=self.no_color)
+                subprocess.run(["systemctl", "enable", svc], check=False)
+                if marker == "DISABLED_RUNNING":
+                    subprocess.run(["systemctl", "start", svc], check=False)
+                log_action(self.info.name, f"re-enabled {svc}", quiet=self.quiet, no_color=self.no_color)
+                reverted += 1
+                self.state.remove(self.info.name, rec["path"], rec["backup"])
+
+        if reverted:
+            return True, f"re-enabled {reverted} service(s)"
+        return False, "no services could be re-enabled"
+
+    def status(self) -> ModStatus:
+        data = self.analyze()
+        if not data['susp_running'] and not data['susp_enabled']:
+            return ModStatus.APPLIED
+        return ModStatus.PARTIAL
+
+class Firejail(Module):
+    info = ModInfo(
+        name="firejail",
+        kind=ModKind.SANDBOX,
+        desc="create firejail profiles for browsers",
+        version="2.0.0",
+        author="archguard",
+        deps=["firejail"],
+        conflicts=[],
+        reversible=True,
+        risk="medium"
+    )
+
+    def gen_config(self) -> Dict[str, str]:
+        content = """# firejail profile for {browser} – generated by archguard
+# basic sandboxing: private /tmp, no network except needed, seccomp
+
+netfilter
+protocol unix,inet,inet6
+private
+private-dev
+private-tmp
+private-opt none
+seccomp
+caps.drop all
+ipc-namespace
+x11
+"""
+        res = {}
+        fj_dir = Path("/etc/firejail")
+        for br in ["firefox", "chromium", "brave"]:
+            path = fj_dir / f"{br}.local"
+            if not path.exists():
+                res[str(path)] = content.format(browser=br)
+        return res
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        Path("/etc/firejail").mkdir(parents=True, exist_ok=True)
+        return super().apply(dry, force, verify, **kw)
+
+    def status(self) -> ModStatus:
+        if not shutil.which("firejail"):
+            return ModStatus.UNKNOWN
+        profiles = list(Path("/etc/firejail").glob("*.local"))
+        if profiles:
+            return ModStatus.APPLIED
+        return ModStatus.PARTIAL
+
+class Audit(Module):
+    info = ModInfo(
+        name="auditd",
+        kind=ModKind.AUDIT,
+        desc="enable auditd with basic rules (file access, exec, mounts)",
+        version="2.0.0",
+        author="archguard",
+        deps=["audit"],
+        conflicts=[],
+        reversible=True,
+        risk="medium"
+    )
+
+    def gen_config(self) -> Dict[str, str]:
+        rules = """# archguard audit rules
+-D
+-b 8192
+-f 1
+
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/ssh/sshd_config -p wa -k sshd
+
+-a always,exit -F arch=b64 -S execve -k process_execution
+-a always,exit -F arch=b32 -S execve -k process_execution
+
+-a always,exit -F arch=b64 -S mount -k mounting
+-a always,exit -F arch=b32 -S mount -k mounting
+
+-w /sbin/insmod -p x -k modules
+-w /sbin/rmmod -p x -k modules
+-w /sbin/modprobe -p x -k modules
+-a always,exit -F arch=b64 -S init_module -S delete_module -k modules
+"""
+        return {"/etc/audit/rules.d/archguard.rules": rules}
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        ok, msg = super().apply(dry, force, verify, **kw)
+        if ok and not dry:
+            subprocess.run(["systemctl", "enable", "auditd"], check=False)
+            subprocess.run(["systemctl", "start", "auditd"], check=False)
+            subprocess.run(["augenrules", "--load"], check=False)
+            log_action(self.info.name, "auditd enabled and rules loaded", quiet=self.quiet, no_color=self.no_color)
+        return ok, msg
+
+    def status(self) -> ModStatus:
+        r = subprocess.run(["systemctl", "is-active", "auditd"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip() == "active":
+            return ModStatus.APPLIED
+        return ModStatus.UNKNOWN
+
+    def verify(self) -> Tuple[bool, str]:
+        r = subprocess.run(["auditctl", "-l"], capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, "auditctl failed"
+        if "-k identity" not in r.stdout:
+            return False, "identity rules not loaded"
+        return True, "ok"
+
+class UsbLockdown(Module):
+    info = ModInfo(
+        name="usb_lockdown",
+        kind=ModKind.FILESYSTEM,
+        desc="blacklist usb-storage module",
+        version="2.0.0",
+        author="archguard",
+        deps=[],
+        conflicts=[],
+        reversible=True,
+        risk="high"
+    )
+
+    def pre_check(self, force=False, install_deps=False) -> Tuple[bool, str]:
+        ok, msg = super().pre_check(force, install_deps)
+        if not ok:
+            return ok, msg
+        if not force:
+            return False, "USB lockdown is high‑risk; use --force to apply"
+        return True, "ok"
+
+    def gen_config(self) -> Dict[str, str]:
+        return {"/etc/modprobe.d/archguard-usb-blacklist.conf": "blacklist usb-storage\n"}
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        ok, msg = super().apply(dry, force, verify, **kw)
+        if ok and not dry:
+            subprocess.run(["modprobe", "-r", "usb-storage"], check=False)
+            log_action(self.info.name, "USB storage blacklisted (module unloaded)", quiet=self.quiet, no_color=self.no_color)
+        return ok, msg
+
+    def status(self) -> ModStatus:
+        if Path("/etc/modprobe.d/archguard-usb-blacklist.conf").exists():
+            return ModStatus.APPLIED
+        return ModStatus.UNKNOWN
+
+class SystemdSandbox(Module):
+    info = ModInfo(
+        name="systemd_sandbox",
+        kind=ModKind.SANDBOX,
+        desc="add sandboxing options to systemd services",
+        version="2.0.0",
+        author="archguard",
+        deps=[],
+        conflicts=[],
+        reversible=True,
+        risk="high"
+    )
+
+    def __init__(self, state: State, quiet=False, verbose=False, no_color=False):
+        super().__init__(state, quiet, verbose, no_color)
+        self.targets = ["systemd-networkd.service", "systemd-resolved.service", "cups.service", "bluetooth.service"]
+        self.available_targets = []
+
+    def pre_check(self, force=False, install_deps=False) -> Tuple[bool, str]:
+        ok, msg = super().pre_check(force, install_deps)
+        if not ok:
+            return ok, msg
+        self.available_targets = []
+        for svc in self.targets:
+            r = subprocess.run(["systemctl", "cat", svc], capture_output=True)
+            if r.returncode == 0:
+                self.available_targets.append(svc)
+            else:
+                log_action(self.info.name, f"service {svc} not found, skipping", "warning", self.quiet, self.no_color)
+        if not self.available_targets:
+            return False, "no target services found"
+        return True, "ok"
+
+    def gen_config(self) -> Dict[str, str]:
+        if not self._pre_checked:
+            return {}
+        overrides = {}
+        for svc in self.available_targets:
+            d = Path(f"/etc/systemd/system/{svc}.d")
+            f = d / "archguard-sandbox.conf"
+            if not f.exists():
+                content = """[Service]
+# added by archguard
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+"""
+                overrides[str(f)] = content
+        return overrides
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        ok, msg = super().apply(dry, force, verify, **kw)
+        if ok and not dry:
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
+            if force:
+                changes = self.state.get(self.info.name)
+                for rec in changes:
+                    if rec["backup"] == "NEW_FILE" and rec["path"].endswith(".conf"):
+                        p = Path(rec["path"])
+                        svc = p.parent.parent.name
+                        subprocess.run(["systemctl", "restart", svc], check=False)
+                log_action(self.info.name, "sandboxing applied and affected services restarted", quiet=self.quiet, no_color=self.no_color)
+            else:
+                log_action(self.info.name, "overrides created – run 'systemctl daemon-reload' and restart services manually (or use --force)", "warning", self.quiet, self.no_color)
+        return ok, msg
+
+    def status(self) -> ModStatus:
+        existing_targets = []
+        for svc in self.targets:
+            r = subprocess.run(["systemctl", "cat", svc], capture_output=True)
+            if r.returncode == 0:
+                existing_targets.append(svc)
+        if not existing_targets:
+            return ModStatus.UNKNOWN
+        found = 0
+        for svc in existing_targets:
+            if Path(f"/etc/systemd/system/{svc}.d/archguard-sandbox.conf").exists():
+                found += 1
+        if found == len(existing_targets):
+            return ModStatus.APPLIED
+        elif found > 0:
+            return ModStatus.PARTIAL
+        return ModStatus.UNKNOWN
+
+# ======================================================================
+# NEW AUDIT MODULES (aggressive scanning)
+# ======================================================================
+
+class RootkitHunter(Module):
+    info = ModInfo(
+        name="rkhunter",
+        kind=ModKind.MALWARE,
+        desc="Rootkit Hunter – scan for rootkits, backdoors, and local exploits",
+        version="2.0.0",
+        author="archguard",
+        deps=["rkhunter"],
+        conflicts=[],
+        reversible=False,
+        risk="low"
+    )
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        if dry:
+            log_action(self.info.name, "dry run: would run rkhunter --check", quiet=self.quiet, no_color=self.no_color)
+            return True, "dry run"
+
+        install_deps = kw.get("install_deps", False)
+        ok, msg = self.pre_check(force, install_deps)
+        if not ok:
+            return False, msg
+
+        # Update rkhunter DB
+        subprocess.run(["rkhunter", "--update"], check=False)
+
+        # Run check
+        result = subprocess.run(
+            ["rkhunter", "--check", "--skip-keypress", "--report-warnings-only"],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            # warnings found
+            log_action(self.info.name, "rkhunter reported issues:", "warning", quiet=self.quiet, no_color=self.no_color)
+            for line in result.stdout.splitlines():
+                print(f"  {line}")
+            # Also log to journal
+            log_action(self.info.name, f"rkhunter warnings: {result.stdout}", "warning", quiet=self.quiet, no_color=self.no_color)
+            return False, "warnings found"
+        else:
+            log_action(self.info.name, "rkhunter scan completed clean", quiet=self.quiet, no_color=self.no_color)
+            return True, "clean"
+
+    def status(self) -> ModStatus:
+        # Not really applicable; return UNKNOWN
+        return ModStatus.UNKNOWN
+
+class Lynis(Module):
+    info = ModInfo(
+        name="lynis",
+        kind=ModKind.AUDIT,
+        desc="Lynis security audit – system hardenings, vulnerabilities, suggestions",
+        version="2.0.0",
+        author="archguard",
+        deps=["lynis"],
+        conflicts=[],
+        reversible=False,
+        risk="low"
+    )
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        if dry:
+            log_action(self.info.name, "dry run: would run lynis audit system", quiet=self.quiet, no_color=self.no_color)
+            return True, "dry run"
+
+        install_deps = kw.get("install_deps", False)
+        ok, msg = self.pre_check(force, install_deps)
+        if not ok:
+            return False, msg
+
+        result = subprocess.run(
+            ["lynis", "audit", "system", "--quiet", "--no-colors"],
+            capture_output=True, text=True
+        )
+        # Extract warnings and suggestions
+        warnings = [line for line in result.stdout.splitlines() if "Warning:" in line]
+        suggestions = [line for line in result.stdout.splitlines() if "Suggestion:" in line]
+
+        if warnings:
+            log_action(self.info.name, f"Lynis found {len(warnings)} warnings", "warning", quiet=self.quiet, no_color=self.no_color)
+            for w in warnings:
+                print(f"  {w}")
+        if suggestions:
+            log_action(self.info.name, f"Lynis gave {len(suggestions)} suggestions", "info", quiet=self.quiet, no_color=self.no_color)
+            if self.verbose:
+                for s in suggestions:
+                    print(f"  {s}")
+
+        # Optionally save full report
+        report_file = Path("/var/log/archguard/lynis.log")
+        report_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_file, 'w') as f:
+            f.write(result.stdout)
+
+        if warnings:
+            return False, f"{len(warnings)} warnings found"
+        return True, "audit completed"
+
+class AIDE(Module):
+    info = ModInfo(
+        name="aide",
+        kind=ModKind.INTEGRITY,
+        desc="Advanced Intrusion Detection Environment – file integrity checker",
+        version="2.0.0",
+        author="archguard",
+        deps=["aide"],
+        conflicts=[],
+        reversible=True,   # can revert config changes, but database is separate
+        risk="medium"
+    )
+
+    def gen_config(self) -> Dict[str, str]:
+        # Generate a basic aide.conf
+        conf = """# AIDE config for archguard
+database=file:/var/lib/aide/aide.db.gz
+database_out=file:/var/lib/aide/aide.db.new.gz
+verbose=5
+report_url=file:/var/log/aide/aide.log
+/ boot    NORMAL
+/bin     NORMAL
+/sbin    NORMAL
+/lib     NORMAL
+/lib64   NORMAL
+/opt     NORMAL
+/usr     NORMAL
+/root    NORMAL
+/etc     NORMAL
+"""
+        return {"/etc/aide/aide.conf": conf}
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        # First, ensure config is written
+        ok, msg = super().apply(dry, force, verify, **kw)
+        if not ok or dry:
+            return ok, msg
+
+        # Initialize database if not exists
+        if not Path("/var/lib/aide/aide.db.gz").exists():
+            log_action(self.info.name, "initializing AIDE database (this may take a while)...", quiet=self.quiet, no_color=self.no_color)
+            subprocess.run(["aide", "--init"], check=False)
+            shutil.move("/var/lib/aide/aide.db.new.gz", "/var/lib/aide/aide.db.gz")
+            log_action(self.info.name, "AIDE database initialized", quiet=self.quiet, no_color=self.no_color)
+        else:
+            log_action(self.info.name, "AIDE database already exists", quiet=self.quiet, no_color=self.no_color)
+
+        return True, "aide configured"
+
+    def verify(self) -> Tuple[bool, str]:
+        # Run integrity check
+        result = subprocess.run(["aide", "--check"], capture_output=True, text=True)
+        if result.returncode != 0:
+            log_action(self.info.name, "AIDE detected file changes:", "warning", quiet=self.quiet, no_color=self.no_color)
+            for line in result.stdout.splitlines():
+                if "changed" in line or "added" in line or "removed" in line:
+                    print(f"  {line}")
+            return False, "changes detected"
+        log_action(self.info.name, "AIDE integrity check passed", quiet=self.quiet, no_color=self.no_color)
+        return True, "integrity ok"
+
+class ClamAV(Module):
+    info = ModInfo(
+        name="clamav",
+        kind=ModKind.MALWARE,
+        desc="ClamAV on‑demand malware scan (scans /home, /tmp, /var)",
+        version="2.0.0",
+        author="archguard",
+        deps=["clamav"],
+        conflicts=[],
+        reversible=False,
+        risk="low"
+    )
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        if dry:
+            log_action(self.info.name, "dry run: would run clamscan", quiet=self.quiet, no_color=self.no_color)
+            return True, "dry run"
+
+        install_deps = kw.get("install_deps", False)
+        ok, msg = self.pre_check(force, install_deps)
+        if not ok:
+            return False, msg
+
+        # Update virus definitions
+        log_action(self.info.name, "updating ClamAV definitions...", quiet=self.quiet, no_color=self.no_color)
+        subprocess.run(["freshclam"], check=False)
+
+        # Scan common directories
+        scan_dirs = ["/home", "/tmp", "/var/tmp", "/var/www", "/opt"]
+        log_action(self.info.name, "scanning for malware (this may take a while)...", quiet=self.quiet, no_color=self.no_color)
+        result = subprocess.run(
+            ["clamscan", "-r", "--quiet"] + scan_dirs,
+            capture_output=True, text=True
+        )
+        # Parse summary
+        infected = 0
+        for line in result.stdout.splitlines():
+            if "Infected files:" in line:
+                infected = int(line.split(":")[1].strip())
+                break
+
+        if infected > 0:
+            log_action(self.info.name, f"ClamAV found {infected} infected files", "warning", quiet=self.quiet, no_color=self.no_color)
+            # Show first few infected files
+            for line in result.stdout.splitlines():
+                if "FOUND" in line:
+                    print(f"  {line}")
+            return False, f"{infected} infected files found"
+        else:
+            log_action(self.info.name, "ClamAV scan completed – no threats found", quiet=self.quiet, no_color=self.no_color)
+            return True, "clean"
+
+class ArchSecurity(Module):
+    info = ModInfo(
+        name="archsec",
+        kind=ModKind.AUDIT,
+        desc="Check installed packages against Arch CVE tracker",
+        version="2.0.0",
+        author="archguard",
+        deps=["curl"],
+        conflicts=[],
+        reversible=False,
+        risk="low"
+    )
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        if dry:
+            log_action(self.info.name, "dry run: would fetch CVE data", quiet=self.quiet, no_color=self.no_color)
+            return True, "dry run"
+
+        install_deps = kw.get("install_deps", False)
+        ok, msg = self.pre_check(force, install_deps)
+        if not ok:
+            return False, msg
+
+        # Fetch Arch CVE JSON
+        url = "https://security.archlinux.org/all.json"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                data = json.loads(response.read())
+        except (urllib.error.URLError, json.JSONDecodeError) as e:
+            log_action(self.info.name, f"failed to fetch CVE data: {e}", "error", quiet=self.quiet, no_color=self.no_color)
+            return False, "network error"
+
+        # Get list of installed packages
+        result = subprocess.run(["pacman", "-Q"], capture_output=True, text=True)
+        installed = {}
+        for line in result.stdout.splitlines():
+            if ' ' in line:
+                pkg, ver = line.split(' ', 1)
+                installed[pkg] = ver
+
+        vulnerable = []
+        for advisory in data:
+            pkg = advisory.get("package")
+            if pkg in installed:
+                # Check if installed version is affected (simplified: any listed version)
+                # The advisory contains "fixed" version, we need to compare.
+                # This is complex; for now, we just flag if package is in list.
+                # A proper implementation would compare versions.
+                vulnerable.append(advisory)
+
+        if vulnerable:
+            log_action(self.info.name, f"Found {len(vulnerable)} packages with known vulnerabilities", "warning", quiet=self.quiet, no_color=self.no_color)
+            for adv in vulnerable[:10]:  # show first 10
+                print(f"  {adv['package']}: {adv['type']} – {adv['severity']} – {adv['advisory']}")
+            if len(vulnerable) > 10:
+                print(f"  ... and {len(vulnerable)-10} more")
+            return False, f"{len(vulnerable)} vulnerable packages"
+        else:
+            log_action(self.info.name, "No known vulnerable packages found", quiet=self.quiet, no_color=self.no_color)
+            return True, "clean"
+
+class KernelModules(Module):
+    info = ModInfo(
+        name="kernel_modules",
+        kind=ModKind.KERNEL,
+        desc="Blacklist unnecessary/risky kernel modules (bluetooth, thunderbolt, firewire, etc.)",
+        version="2.0.0",
+        author="archguard",
+        deps=[],
+        conflicts=[],
+        reversible=True,
+        risk="high"
+    )
+
+    def pre_check(self, force=False, install_deps=False) -> Tuple[bool, str]:
+        ok, msg = super().pre_check(force, install_deps)
+        if not ok:
+            return ok, msg
+        if not force:
+            return False, "kernel module blacklisting is high‑risk; use --force to apply"
+        return True, "ok"
+
+    def gen_config(self) -> Dict[str, str]:
+        blacklist = """# Blacklist risky kernel modules (added by archguard)
+blacklist bluetooth
+blacklist btusb
+blacklist thunderbolt
+blacklist firewire_ohci
+blacklist firewire_sbp2
+blacklist uas
+blacklist usb_storage   # already covered by usb_lockdown, but included for completeness
+blacklist sctp
+blacklist dccp
+blacklist rds
+blacklist tipc
+blacklist n_hdlc
+blacklist can
+blacklist atm
+"""
+        return {"/etc/modprobe.d/archguard-blacklist.conf": blacklist}
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        ok, msg = super().apply(dry, force, verify, **kw)
+        if ok and not dry:
+            # Optionally unload modules if they are loaded
+            for mod in ["bluetooth", "thunderbolt", "firewire_ohci"]:
+                subprocess.run(["modprobe", "-r", mod], check=False)
+            log_action(self.info.name, "kernel modules blacklisted", quiet=self.quiet, no_color=self.no_color)
+        return ok, msg
+
+    def status(self) -> ModStatus:
+        if Path("/etc/modprobe.d/archguard-blacklist.conf").exists():
+            return ModStatus.APPLIED
+        return ModStatus.UNKNOWN
+
+class NetworkAudit(Module):
+    info = ModInfo(
+        name="network_audit",
+        kind=ModKind.NETWORK,
+        desc="Scan local network interfaces for open ports, check firewall rules",
+        version="2.0.0",
+        author="archguard",
+        deps=["nmap"],
+        conflicts=[],
+        reversible=False,
+        risk="low"
+    )
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        if dry:
+            log_action(self.info.name, "dry run: would run nmap and firewall checks", quiet=self.quiet, no_color=self.no_color)
+            return True, "dry run"
+
+        install_deps = kw.get("install_deps", False)
+        ok, msg = self.pre_check(force, install_deps)
+        if not ok:
+            return False, msg
+
+        # Check listening ports with ss
+        log_action(self.info.name, "checking listening ports...", quiet=self.quiet, no_color=self.no_color)
+        ss_result = subprocess.run(["ss", "-tulpn"], capture_output=True, text=True)
+        listening = [line for line in ss_result.stdout.splitlines() if "LISTEN" in line]
+        if listening:
+            log_action(self.info.name, f"Found {len(listening)} listening ports", "info", quiet=self.quiet, no_color=self.no_color)
+            if self.verbose:
+                for line in listening:
+                    print(f"  {line}")
+        else:
+            log_action(self.info.name, "No listening ports found", quiet=self.quiet, no_color=self.no_color)
+
+        # Run nmap against localhost
+        log_action(self.info.name, "scanning localhost with nmap...", quiet=self.quiet, no_color=self.no_color)
+        nmap_result = subprocess.run(
+            ["nmap", "-sT", "-p-", "127.0.0.1"],
+            capture_output=True, text=True
+        )
+        open_ports = [line for line in nmap_result.stdout.splitlines() if "/tcp" in line and "open" in line]
+        if open_ports:
+            log_action(self.info.name, f"nmap found {len(open_ports)} open TCP ports on localhost", "warning", quiet=self.quiet, no_color=self.no_color)
+            for line in open_ports:
+                print(f"  {line}")
+        else:
+            log_action(self.info.name, "nmap found no open TCP ports on localhost", quiet=self.quiet, no_color=self.no_color)
+
+        # Check firewall rules
+        log_action(self.info.name, "checking firewall status...", quiet=self.quiet, no_color=self.no_color)
+        nft_rules = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True)
+        if nft_rules.returncode == 0 and nft_rules.stdout.strip():
+            log_action(self.info.name, "nftables rules are present", quiet=self.quiet, no_color=self.no_color)
+        else:
+            log_action(self.info.name, "No nftables rules found", "warning", quiet=self.quiet, no_color=self.no_color)
+
+        return True, "network audit completed"
+
+class PackageVerification(Module):
+    info = ModInfo(
+        name="pkg_verify",
+        kind=ModKind.INTEGRITY,
+        desc="Verify package signatures, file permissions, and find orphaned files",
+        version="2.0.0",
+        author="archguard",
+        deps=["pacman"],
+        conflicts=[],
+        reversible=False,
+        risk="low"
+    )
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        if dry:
+            log_action(self.info.name, "dry run: would verify packages", quiet=self.quiet, no_color=self.no_color)
+            return True, "dry run"
+
+        # Check pacman database integrity
+        log_action(self.info.name, "checking package database...", quiet=self.quiet, no_color=self.no_color)
+        db_check = subprocess.run(["pacman", "-Dk"], capture_output=True, text=True)
+        if db_check.returncode != 0:
+            log_action(self.info.name, "pacman database has errors", "warning", quiet=self.quiet, no_color=self.no_color)
+            print(db_check.stdout)
+
+        # Check for missing files
+        log_action(self.info.name, "checking for missing package files...", quiet=self.quiet, no_color=self.no_color)
+        missing = subprocess.run(["pacman", "-Qk"], capture_output=True, text=True)
+        missing_lines = [line for line in missing.stdout.splitlines() if "missing" in line]
+        if missing_lines:
+            log_action(self.info.name, f"Found {len(missing_lines)} missing files", "warning", quiet=self.quiet, no_color=self.no_color)
+            if self.verbose:
+                for line in missing_lines[:10]:
+                    print(f"  {line}")
+                if len(missing_lines) > 10:
+                    print("  ...")
+
+        # Check for orphaned packages
+        log_action(self.info.name, "checking for orphaned packages...", quiet=self.quiet, no_color=self.no_color)
+        orphans = subprocess.run(["pacman", "-Qdt"], capture_output=True, text=True)
+        if orphans.stdout.strip():
+            orphan_list = orphans.stdout.splitlines()
+            log_action(self.info.name, f"Found {len(orphan_list)} orphaned packages", "warning", quiet=self.quiet, no_color=self.no_color)
+            if self.verbose:
+                for line in orphan_list[:10]:
+                    print(f"  {line}")
+                if len(orphan_list) > 10:
+                    print("  ...")
+
+        # Check for .pacnew files
+        log_action(self.info.name, "checking for .pacnew files...", quiet=self.quiet, no_color=self.no_color)
+        pacnew = subprocess.run(["find", "/etc", "-name", "*.pacnew"], capture_output=True, text=True)
+        if pacnew.stdout.strip():
+            pacnew_list = pacnew.stdout.splitlines()
+            log_action(self.info.name, f"Found {len(pacnew_list)} .pacnew files", "info", quiet=self.quiet, no_color=self.no_color)
+            if self.verbose:
+                for line in pacnew_list[:10]:
+                    print(f"  {line}")
+                if len(pacnew_list) > 10:
+                    print("  ...")
+
+        return True, "package verification completed"
+
+class LogAudit(Module):
+    info = ModInfo(
+        name="log_audit",
+        kind=ModKind.AUDIT,
+        desc="Scan system logs for anomalies (failed logins, service crashes, etc.)",
+        version="2.0.0",
+        author="archguard",
+        deps=[],
+        conflicts=[],
+        reversible=False,
+        risk="low"
+    )
+
+    def apply(self, dry=False, force=False, verify=False, **kw) -> Tuple[bool, str]:
+        if dry:
+            log_action(self.info.name, "dry run: would scan journal", quiet=self.quiet, no_color=self.no_color)
+            return True, "dry run"
+
+        # Check for failed sudo attempts
+        log_action(self.info.name, "checking for failed sudo attempts...", quiet=self.quiet, no_color=self.no_color)
+        sudo_fail = subprocess.run(
+            ["journalctl", "-q", "--since", "24 hours ago", "grep", "sudo.*authentication failure"],
+            capture_output=True, text=True
+        )
+        if sudo_fail.stdout.strip():
+            lines = sudo_fail.stdout.splitlines()
+            log_action(self.info.name, f"Found {len(lines)} failed sudo attempts in last 24h", "warning", quiet=self.quiet, no_color=self.no_color)
+            if self.verbose:
+                for line in lines[:5]:
+                    print(f"  {line}")
+                if len(lines) > 5:
+                    print("  ...")
+
+        # Check for sshd failures
+        log_action(self.info.name, "checking for sshd failures...", quiet=self.quiet, no_color=self.no_color)
+        ssh_fail = subprocess.run(
+            ["journalctl", "-q", "--since", "24 hours ago", "grep", "sshd.*Failed password"],
+            capture_output=True, text=True
+        )
+        if ssh_fail.stdout.strip():
+            lines = ssh_fail.stdout.splitlines()
+            log_action(self.info.name, f"Found {len(lines)} failed SSH login attempts in last 24h", "warning", quiet=self.quiet, no_color=self.no_color)
+            if self.verbose:
+                for line in lines[:5]:
+                    print(f"  {line}")
+                if len(lines) > 5:
+                    print("  ...")
+
+        # Check for service crashes
+        log_action(self.info.name, "checking for service crashes...", quiet=self.quiet, no_color=self.no_color)
+        crashes = subprocess.run(
+            ["journalctl", "-q", "--since", "24 hours ago", "grep", "unit.*failed"],
+            capture_output=True, text=True
+        )
+        if crashes.stdout.strip():
+            lines = crashes.stdout.splitlines()
+            log_action(self.info.name, f"Found {len(lines)} service failures in last 24h", "warning", quiet=self.quiet, no_color=self.no_color)
+            if self.verbose:
+                for line in lines[:5]:
+                    print(f"  {line}")
+                if len(lines) > 5:
+                    print("  ...")
+
+        return True, "log audit completed"
+
+# ----------------------------------------------------------------------
+# presets – apply multiple modules at once
+# ----------------------------------------------------------------------
+
+PRESETS = {
+    "desktop": ["firewall", "kernel", "services", "firejail"],
+    "server": ["firewall", "kernel", "services", "auditd"],
+    "hardened": ["firewall", "apparmor", "kernel", "services", "firejail", "auditd", "usb_lockdown", "systemd_sandbox", "kernel_modules"],
+    "full_audit": ["rkhunter", "lynis", "aide", "clamav", "archsec", "network_audit", "pkg_verify", "log_audit"]
+}
+
+# ----------------------------------------------------------------------
+# main cli
+# ----------------------------------------------------------------------
+
+class ArchGuard:
+    def __init__(self, quiet=False, verbose=False, no_color=False):
+        self.quiet = quiet
+        self.verbose = verbose
+        self.no_color = no_color
+        self.state = State()
+        self.modules = {
+            # Hardening modules
+            "firewall": Firewall(self.state, quiet, verbose, no_color),
+            "apparmor": AppArmor(self.state, quiet, verbose, no_color),
+            "kernel": Kernel(self.state, quiet, verbose, no_color),
+            "services": ServiceMin(self.state, quiet, verbose, no_color),
+            "firejail": Firejail(self.state, quiet, verbose, no_color),
+            "auditd": Audit(self.state, quiet, verbose, no_color),
+            "usb_lockdown": UsbLockdown(self.state, quiet, verbose, no_color),
+            "systemd_sandbox": SystemdSandbox(self.state, quiet, verbose, no_color),
+            "kernel_modules": KernelModules(self.state, quiet, verbose, no_color),
+            # Audit modules
+            "rkhunter": RootkitHunter(self.state, quiet, verbose, no_color),
+            "lynis": Lynis(self.state, quiet, verbose, no_color),
+            "aide": AIDE(self.state, quiet, verbose, no_color),
+            "clamav": ClamAV(self.state, quiet, verbose, no_color),
+            "archsec": ArchSecurity(self.state, quiet, verbose, no_color),
+            "network_audit": NetworkAudit(self.state, quiet, verbose, no_color),
+            "pkg_verify": PackageVerification(self.state, quiet, verbose, no_color),
+            "log_audit": LogAudit(self.state, quiet, verbose, no_color),
+        }
+        for preset, mods in PRESETS.items():
+            for m in mods:
+                if m not in self.modules:
+                    raise RuntimeError(f"preset '{preset}' references unknown module '{m}'")
+
+    def list(self):
+        if not self.quiet:
+            if not self.no_color:
+                print("\n📦 available modules:")
+            else:
+                print("\navailable modules:")
+            print("="*60)
+        for name, mod in self.modules.items():
+            info = mod.info
+            stat = mod.status()
+            sym = {
+                ModStatus.APPLIED: "✓",
+                ModStatus.PARTIAL: "◔",
+                ModStatus.UNKNOWN: "○",
+                ModStatus.CONFLICT: "✗",
+                ModStatus.ERROR: "⚠"
+            }.get(stat, "○")
+            if not self.quiet:
+                if not self.no_color:
+                    print(f"\n{sym} \033[1m{name}\033[0m")
+                else:
+                    print(f"\n{sym} {name}")
+                print(f"  📝 {info.desc}")
+                print(f"  🔧 type: {info.kind.value}")
+                print(f"  ⚡ risk: {info.risk}")
+                print(f"  🔄 reversible: {'✓' if info.reversible else '✗'}")
+                if info.deps:
+                    print(f"  📦 deps: {', '.join(info.deps)}")
+            else:
+                print(f"{name}: {stat.value}")
+
+    def apply_one(self, name: str, dry=False, force=False, verify=False, **kw):
+        if name not in self.modules:
+            print(f"unknown module '{name}'")
+            return
+        mod = self.modules[name]
+        if not self.quiet:
+            if not self.no_color:
+                print(f"\n🔧 applying \033[1m{name}\033[0m – {mod.info.desc}")
+            else:
+                print(f"\napplying {name} – {mod.info.desc}")
+            print("-"*50)
+        if dry and not self.quiet:
+            if not self.no_color:
+                print("🔍 dry run – no changes will be written")
+            else:
+                print("dry run – no changes will be written")
+        ok, msg = mod.apply(dry, force, verify, **kw)
+        if ok:
+            if not self.quiet:
+                if not self.no_color:
+                    print(f"\n\033[92m✓ {msg}\033[0m")
+                else:
+                    print(f"\nOK: {msg}")
+            else:
+                print(f"{name}: applied ({msg})")
+        else:
+            if not self.quiet:
+                if not self.no_color:
+                    print(f"\n\033[91m✗ {msg}\033[0m")
+                else:
+                    print(f"\nFAIL: {msg}")
+            else:
+                print(f"{name}: failed – {msg}")
+
+    def apply_preset(self, preset: str, dry=False, force=False, verify=False, install_deps=False):
+        if preset not in PRESETS:
+            print(f"unknown preset '{preset}'")
+            return
+        if not self.quiet:
+            if not self.no_color:
+                print(f"\n🎯 applying preset: \033[1m{preset}\033[0m")
+            else:
+                print(f"\napplying preset: {preset}")
+        for mod in PRESETS[preset]:
+            self.apply_one(mod, dry, force, verify, install_deps=install_deps)
+            if not self.quiet:
+                print()
+
+    def revert(self, name: str):
+        if name not in self.modules:
+            print(f"unknown module '{name}'")
+            return
+        mod = self.modules[name]
+        if not self.quiet:
+            if not self.no_color:
+                print(f"\n↻ reverting \033[1m{name}\033[0m")
+            else:
+                print(f"\nreverting {name}")
+            print("-"*50)
+        if not mod.info.reversible:
+            print("module is not reversible")
+            return
+        ok, msg = mod.revert()
+        if ok:
+            if not self.quiet:
+                if not self.no_color:
+                    print(f"\n\033[92m✓ {msg}\033[0m")
+                else:
+                    print(f"\nOK: {msg}")
+            else:
+                print(f"{name}: reverted")
+        else:
+            if not self.quiet:
+                if not self.no_color:
+                    print(f"\n\033[91m✗ {msg}\033[0m")
+                else:
+                    print(f"\nFAIL: {msg}")
+            else:
+                print(f"{name}: revert failed – {msg}")
+
+    def status(self):
+        if not self.quiet:
+            if not self.no_color:
+                print("\n📊 system hardening status:")
+            else:
+                print("\nsystem hardening status:")
+            print("="*60)
+        for name, mod in self.modules.items():
+            stat = mod.status()
+            if not self.quiet:
+                if not self.no_color:
+                    disp = {
+                        ModStatus.APPLIED: "\033[92mAPPLIED\033[0m",
+                        ModStatus.PARTIAL: "\033[93mPARTIAL\033[0m",
+                        ModStatus.UNKNOWN: "\033[90mNOT APPLIED\033[0m",
+                        ModStatus.CONFLICT: "\033[91mCONFLICT\033[0m",
+                        ModStatus.ERROR: "\033[91mERROR\033[0m"
+                    }.get(stat, "\033[90mUNKNOWN\033[0m")
+                else:
+                    disp = stat.value.upper()
+                print(f"{name:20} : {disp}")
+            else:
+                print(f"{name}: {stat.value}")
+
+    def backups(self, module=None, days=None, limit=None):
+        since = None
+        if days is not None:
+            since = datetime.now() - timedelta(days=days)
+        recs = self.state.get(module, since=since, limit=limit)
+        if not recs:
+            print("no backups found")
+            return
+        if not self.quiet:
+            if not self.no_color:
+                print("\n📂 backup history:")
+            else:
+                print("\nbackup history:")
+            print("="*60)
+        for r in recs:
+            if not self.quiet:
+                print(f"  • {r['when']} – {r['module']}: {r['path']} -> {r['backup']}")
+            else:
+                print(f"{r['when']} {r['module']} {r['path']} {r['backup']}")
+
+# ----------------------------------------------------------------------
+# entry point
+# ----------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="archguard – aggressive security auditing & hardening for Arch Linux",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  archguard list
+  archguard status
+  archguard apply firewall --profile workstation
+  archguard apply kernel --paranoid
+  archguard apply --preset hardened
+  archguard apply --preset full_audit --install-deps
+  archguard audit rkhunter
+  archguard audit lynis
+  archguard revert firewall
+  archguard backups --days 7
+        """
+    )
+    parser.add_argument("--quiet", action="store_true", help="minimal output (no emoji, less verbose)")
+    parser.add_argument("--verbose", action="store_true", help="show diffs and detailed output")
+    parser.add_argument("--no-color", action="store_true", help="disable ANSI color codes")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list", help="show available modules")
+    sub.add_parser("status", help="show applied status for hardening modules")
+
+    bp = sub.add_parser("backups", help="list change history")
+    bp.add_argument("--module", help="filter by module name")
+    bp.add_argument("--days", type=int, help="show only last N days")
+    bp.add_argument("--limit", type=int, help="max number of records to show")
+
+    ap = sub.add_parser("apply", help="apply a hardening module or preset")
+    ap.add_argument("name", nargs="?", help="module name (omit if using --preset)")
+    ap.add_argument("--preset", choices=PRESETS.keys(), help="apply a preset instead of a single module")
+    ap.add_argument("--dry-run", action="store_true", help="preview changes")
+    ap.add_argument("--force", "-f", action="store_true", help="skip confirmations AND override conflict checks")
+    ap.add_argument("--verify", action="store_true", help="run runtime verification after applying")
+    ap.add_argument("--install-deps", action="store_true", help="automatically install missing dependencies")
+    ap.add_argument("--profile", choices=["workstation", "server", "paranoid", "strict"],
+                    help="firewall profile (only used with firewall module)")
+    ap.add_argument("--paranoid", action="store_true", help="enable extra paranoid sysctl options (kernel module)")
+
+    rv = sub.add_parser("revert", help="undo a hardening module's changes")
+    rv.add_argument("module", help="module name")
+
+    audit_parser = sub.add_parser("audit", help="run an audit module (read‑only scan)")
+    audit_parser.add_argument("name", help="audit module name (e.g., rkhunter, lynis, aide, clamav, archsec, network_audit, pkg_verify, log_audit)")
+    audit_parser.add_argument("--dry-run", action="store_true", help="preview what would be scanned")
+    audit_parser.add_argument("--force", "-f", action="store_true", help="skip confirmations (if any)")
+    audit_parser.add_argument("--install-deps", action="store_true", help="automatically install missing dependencies")
+
+    args = parser.parse_args()
+
+    if not sys.stdout.isatty() and not args.no_color:
+        args.no_color = True
+
+    if args.cmd in ["apply", "revert"] and os.geteuid() != 0:
+        print("this command needs root – try again with sudo", file=sys.stderr)
+        sys.exit(1)
+
+    app = ArchGuard(quiet=args.quiet, verbose=args.verbose, no_color=args.no_color)
+
+    if args.cmd == "list":
+        app.list()
+    elif args.cmd == "status":
+        app.status()
+    elif args.cmd == "backups":
+        app.backups(args.module, args.days, args.limit)
+    elif args.cmd == "apply":
+        if args.preset:
+            app.apply_preset(args.preset, args.dry_run, args.force, args.verify, install_deps=args.install_deps)
+        elif args.name:
+            kw = {}
+            if args.name == "firewall" and args.profile:
+                kw["profile"] = args.profile
+            if args.name == "kernel" and args.paranoid:
+                kw["paranoid"] = True
+            kw["install_deps"] = args.install_deps
+            app.apply_one(args.name, args.dry_run, args.force, args.verify, **kw)
+        else:
+            parser.print_help()
+    elif args.cmd == "revert":
+        app.revert(args.module)
+    elif args.cmd == "audit":
+        if args.name not in app.modules:
+            print(f"unknown audit module '{args.name}'")
+            sys.exit(1)
+        mod = app.modules[args.name]
+        if mod.info.kind not in (ModKind.AUDIT, ModKind.MALWARE, ModKind.INTEGRITY, ModKind.NETWORK):
+            print(f"'{args.name}' is not an audit module (it makes changes). Use 'apply' instead.")
+            sys.exit(1)
+        # Run the module's apply method (which does the scan)
+        kw = {"install_deps": args.install_deps}
+        ok, msg = mod.apply(dry=args.dry_run, force=args.force, **kw)
+        if ok:
+            if not args.quiet:
+                print(f"\n✓ {msg}")
+        else:
+            if not args.quiet:
+                print(f"\n✗ {msg}")
+            sys.exit(1)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
