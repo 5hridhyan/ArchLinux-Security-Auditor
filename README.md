@@ -1,8 +1,6 @@
-# archlock
-
 A modular, reversible hardening tool for Arch Linux workstations.
 
-archlock applies sensible security defaults without blindly overwriting your system.  
+applies sensible security defaults without blindly overwriting your system.  
 Every change is tracked. Every file is backed up. Every module can be reverted — even after reboot.
 
 This is not a compliance tool.  
